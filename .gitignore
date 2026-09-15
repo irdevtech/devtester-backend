@@ -1,0 +1,12 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Rust build artifacts
+/target/
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
