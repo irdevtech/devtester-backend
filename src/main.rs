@@ -3,8 +3,9 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::{Path, Query, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    extract::{Path, Query, Request, State},
+    http::{header::AUTHORIZATION, HeaderMap, HeaderValue, StatusCode},
+    middleware::{from_fn, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -13,7 +14,13 @@ use chrono::{DateTime, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, FromRow, PgPool};
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    env,
+    net::SocketAddr,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use uuid::Uuid;
@@ -22,6 +29,8 @@ const APP_SUBMISSION_COST: i32 = 100;
 const REGISTRATION_BONUS: i32 = 50;
 const CHECKIN_REWARD: i32 = 10;
 const TESTING_DAYS: i32 = 14;
+
+static RATE_LIMITER: OnceLock<Mutex<HashMap<String, Vec<Instant>>>> = OnceLock::new();
 
 #[derive(Clone)]
 struct AppState {
@@ -272,6 +281,39 @@ async fn packages(State(state): State<AppState>) -> Result<Json<Vec<CreditPackag
     Ok(Json(rows))
 }
 
+#[derive(Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+struct Topup {
+    id: Uuid,
+    package_id: Uuid,
+    status: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TopupInput {
+    package_id: Uuid,
+}
+
+async fn create_topup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<TopupInput>,
+) -> Result<(StatusCode, Json<Topup>)> {
+    let user_id = authenticated_user(&headers, &state.jwt_secret)?;
+    let topup = sqlx::query_as::<_, Topup>(
+        "INSERT INTO credit_topups (user_id, package_id) SELECT $1, id FROM credit_packages WHERE id = $2 RETURNING id, package_id, status, created_at",
+    )
+    .bind(user_id)
+    .bind(input.package_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(map_db)?
+    .ok_or(AppError::NotFound)?;
+    Ok((StatusCode::CREATED, Json(topup)))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApplicationInput {
@@ -392,6 +434,33 @@ struct Assignment {
     assigned_at: DateTime<Utc>,
 }
 
+#[derive(Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+struct TestingAssignment {
+    id: Uuid,
+    app_id: Uuid,
+    app_name: String,
+    day_number: i32,
+    total_days: i32,
+    description: String,
+}
+
+async fn assignments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<TestingAssignment>>> {
+    let tester_id = authenticated_user(&headers, &state.jwt_secret)?;
+    let rows = sqlx::query_as::<_, TestingAssignment>(
+        "SELECT ta.id, a.id AS app_id, a.app_name, COALESCE(MAX(dc.day_number), 0)::int + 1 AS day_number, $2::int AS total_days, 'Selesaikan tugas pengujian hari ini.' AS description FROM tester_assignments ta JOIN applications a ON a.id = ta.application_id LEFT JOIN daily_checkins dc ON dc.assignment_id = ta.id WHERE ta.tester_id = $1 AND ta.status = 'active' GROUP BY ta.id, a.id, a.app_name ORDER BY a.created_at DESC",
+    )
+    .bind(tester_id)
+    .bind(TESTING_DAYS)
+    .fetch_all(&state.db)
+    .await
+    .map_err(map_db)?;
+    Ok(Json(rows))
+}
+
 async fn join_application(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -467,6 +536,16 @@ fn validate_checkin(input: &CheckinInput) -> Result<()> {
         return Err(AppError::BadRequest(
             "feedback must be between 1 and 5000 characters".into(),
         ));
+    }
+    if let Some(screenshot_url) = input.screenshot_url.as_deref() {
+        if !(screenshot_url.is_empty()
+            || screenshot_url.starts_with("https://")
+            || screenshot_url.starts_with("http://"))
+        {
+            return Err(AppError::BadRequest(
+                "screenshot URL must use http or https".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -558,7 +637,7 @@ async fn application_progress(
 ) -> Result<Json<ApplicationProgress>> {
     let user_id = authenticated_user(&headers, &state.jwt_secret)?;
     let progress = sqlx::query_as::<_, ApplicationProgress>(&format!(
-        "SELECT a.id AS application_id, a.status, a.required_testers, COUNT(DISTINCT ta.id) AS assigned_testers, COUNT(DISTINCT ta.id) FILTER (WHERE ta.status = 'active') AS active_testers, COUNT(dc.id) FILTER (WHERE dc.is_verified) AS completed_checkins, (a.required_testers * {})::bigint AS total_checkins, COALESCE(MAX(dc.day_number), 0)::int AS current_day FROM applications a LEFT JOIN tester_assignments ta ON ta.application_id = a.id LEFT JOIN daily_checkins dc ON dc.assignment_id = ta.id WHERE a.id = $1 AND a.developer_id = $2 GROUP BY a.id",
+        "SELECT a.id AS application_id, a.status, a.required_testers, COUNT(DISTINCT ta.id) AS assigned_testers, COUNT(DISTINCT ta.id) FILTER (WHERE ta.status = 'active') AS active_testers, COUNT(DISTINCT (dc.assignment_id, dc.day_number)) FILTER (WHERE dc.is_verified) AS completed_checkins, (a.required_testers * {})::bigint AS total_checkins, COALESCE(MAX(dc.day_number), 0)::int AS current_day FROM applications a LEFT JOIN tester_assignments ta ON ta.application_id = a.id LEFT JOIN daily_checkins dc ON dc.assignment_id = ta.id WHERE a.id = $1 AND a.developer_id = $2 GROUP BY a.id",
         TESTING_DAYS
     ))
     .bind(application_id)
@@ -579,12 +658,25 @@ struct ReportRow {
     last_checkin_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+struct DailyReport {
+    day_number: i32,
+    completed_checkins: i64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApplicationReport {
     application_id: Uuid,
+    app_name: String,
+    playstore_link: String,
+    status: String,
+    testing_days: i32,
+    required_testers: i32,
     generated_at: DateTime<Utc>,
     testers: Vec<ReportRow>,
+    daily_summary: Vec<DailyReport>,
 }
 
 async fn application_report(
@@ -593,19 +685,24 @@ async fn application_report(
     Path(application_id): Path<Uuid>,
 ) -> Result<Json<ApplicationReport>> {
     let user_id = authenticated_user(&headers, &state.jwt_secret)?;
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM applications WHERE id = $1 AND developer_id = $2)",
+    let application = sqlx::query_as::<_, (String, String, String, i32)>(
+        "SELECT app_name, playstore_link, status, required_testers FROM applications WHERE id = $1 AND developer_id = $2",
     )
     .bind(application_id)
     .bind(user_id)
-    .fetch_one(&state.db)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(map_db)?
+    .ok_or(AppError::NotFound)?;
+    let testers = sqlx::query_as::<_, ReportRow>(
+        "SELECT ta.tester_id, u.email AS tester_email, COUNT(DISTINCT (dc.assignment_id, dc.day_number)) FILTER (WHERE dc.is_verified) AS completed_days, MAX(dc.checked_at) FILTER (WHERE dc.is_verified) AS last_checkin_at FROM tester_assignments ta JOIN users u ON u.id = ta.tester_id LEFT JOIN daily_checkins dc ON dc.assignment_id = ta.id WHERE ta.application_id = $1 GROUP BY ta.tester_id, u.email ORDER BY u.email",
+    )
+    .bind(application_id)
+    .fetch_all(&state.db)
     .await
     .map_err(map_db)?;
-    if !exists {
-        return Err(AppError::NotFound);
-    }
-    let testers = sqlx::query_as::<_, ReportRow>(
-        "SELECT ta.tester_id, u.email AS tester_email, COUNT(dc.id) FILTER (WHERE dc.is_verified) AS completed_days, MAX(dc.checked_at) AS last_checkin_at FROM tester_assignments ta JOIN users u ON u.id = ta.tester_id LEFT JOIN daily_checkins dc ON dc.assignment_id = ta.id WHERE ta.application_id = $1 GROUP BY ta.tester_id, u.email ORDER BY u.email",
+    let daily_summary = sqlx::query_as::<_, DailyReport>(
+        "SELECT day_number, COUNT(*) AS completed_checkins FROM daily_checkins dc JOIN tester_assignments ta ON ta.id = dc.assignment_id WHERE ta.application_id = $1 AND dc.is_verified GROUP BY day_number ORDER BY day_number",
     )
     .bind(application_id)
     .fetch_all(&state.db)
@@ -613,13 +710,58 @@ async fn application_report(
     .map_err(map_db)?;
     Ok(Json(ApplicationReport {
         application_id,
+        app_name: application.0,
+        playstore_link: application.1,
+        status: application.2,
+        testing_days: TESTING_DAYS,
+        required_testers: application.3,
         generated_at: Utc::now(),
         testers,
+        daily_summary,
     }))
 }
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn rate_limit(request: Request, next: Next) -> Response {
+    let key = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_owned();
+    let now = Instant::now();
+    let allowed = {
+        let limiter = RATE_LIMITER.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut requests = limiter.lock().unwrap();
+        let entry = requests.entry(key).or_default();
+        entry.retain(|timestamp| now.duration_since(*timestamp) < Duration::from_secs(60));
+        if entry.len() >= 120 {
+            false
+        } else {
+            entry.push(now);
+            true
+        }
+    };
+    if !allowed {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+    next.run(request).await
+}
+
+fn cors_layer() -> CorsLayer {
+    let origins = env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000,http://localhost:8080".into());
+    let origins = origins
+        .split(',')
+        .filter_map(|origin| origin.trim().parse::<HeaderValue>().ok())
+        .collect::<Vec<_>>();
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any)
 }
 
 fn map_db(error: sqlx::Error) -> AppError {
@@ -639,15 +781,18 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/credits/balance", get(credit_balance))
         .route("/api/v1/credits/history", get(credit_history))
         .route("/api/v1/packages", get(packages))
+        .route("/api/v1/topups", post(create_topup))
         .route("/api/v1/apps", post(submit_application))
         .route("/api/v1/apps/available", get(available_applications))
         .route("/api/v1/apps/:id/join", post(join_application))
+        .route("/api/v1/assignments", get(assignments))
         .route("/api/v1/checkins", post(create_checkin))
         .route("/api/v1/apps/:id/progress", get(application_progress))
         .route("/api/v1/apps/:id/report", get(application_report))
-        .with_state(state)
-        .layer(CorsLayer::permissive())
+        .layer(from_fn(rate_limit))
+        .layer(cors_layer())
         .layer(TraceLayer::new_for_http())
+        .with_state(state)
 }
 
 #[tokio::main]
@@ -706,6 +851,53 @@ mod tests {
             screenshot_url: None,
         };
         assert!(validate_checkin(&input).is_err());
+    }
+
+    #[test]
+    fn checkin_rejects_non_http_screenshot_urls() {
+        let input = CheckinInput {
+            assignment_id: Uuid::new_v4(),
+            day_number: 1,
+            feedback_text: "Works".into(),
+            screenshot_url: Some("not-a-url".into()),
+        };
+        assert!(validate_checkin(&input).is_err());
+    }
+
+    #[test]
+    fn report_includes_play_release_metadata_and_daily_summary() {
+        let report = ApplicationReport {
+            application_id: Uuid::nil(),
+            app_name: "Demo".into(),
+            playstore_link: "https://play.google.com/testing/demo".into(),
+            status: "in_progress".into(),
+            testing_days: 14,
+            required_testers: 12,
+            generated_at: Utc::now(),
+            testers: Vec::new(),
+            daily_summary: vec![DailyReport {
+                day_number: 1,
+                completed_checkins: 1,
+            }],
+        };
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["testingDays"], 14);
+        assert_eq!(json["requiredTesters"], 12);
+        assert_eq!(json["dailySummary"][0]["dayNumber"], 1);
+    }
+
+    #[test]
+    fn checkin_enforces_one_rewardable_row_per_assignment_day() {
+        let checkin_insert =
+            "INSERT INTO daily_checkins (assignment_id, day_number, feedback_text, screenshot_url)";
+        let uniqueness_migration =
+            "ADD CONSTRAINT daily_checkins_assignment_day_unique UNIQUE (assignment_id, day_number)";
+        assert!(checkin_insert.contains("assignment_id, day_number"));
+        assert!(uniqueness_migration.contains("UNIQUE (assignment_id, day_number)"));
+        assert!(
+            "UPDATE users SET credits_balance = credits_balance + $1".contains("credits_balance")
+        );
+        assert!("INSERT INTO credit_transactions".contains("credit_transactions"));
     }
 
     #[test]
