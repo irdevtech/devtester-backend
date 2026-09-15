@@ -11,7 +11,8 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, FromRow, PgPool};
 use std::{
@@ -312,6 +313,328 @@ async fn create_topup(
     .map_err(map_db)?
     .ok_or(AppError::NotFound)?;
     Ok((StatusCode::CREATED, Json(topup)))
+}
+
+const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_PLAY_API_BASE: &str =
+    "https://androidpublisher.googleapis.com/androidpublisher/v3/applications";
+const GOOGLE_PLAY_SCOPE: &str = "https://www.googleapis.com/auth/androidpublisher";
+const GOOGLE_PLAY_PRODUCT_IDS: [&str; 3] = [
+    "devtester_credits_starter",
+    "devtester_credits_pro",
+    "devtester_credits_studio",
+];
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GooglePlayVerifyRequest {
+    product_id: String,
+    purchase_token: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GooglePlayVerifyResponse {
+    credits_awarded: i32,
+    bonus_credits_awarded: i32,
+    credits_balance: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceAccount {
+    client_email: String,
+    private_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceAccountClaims<'a> {
+    iss: &'a str,
+    scope: &'a str,
+    aud: &'a str,
+    exp: i64,
+    iat: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTokenResponse {
+    access_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleProductPurchase {
+    #[serde(rename = "purchaseState")]
+    purchase_state: i32,
+}
+
+#[derive(Debug, FromRow)]
+struct ExistingGooglePurchase {
+    user_id: Uuid,
+    product_id: String,
+    credits_awarded: i32,
+    bonus_credits_awarded: i32,
+}
+
+fn validate_google_play_request(input: &GooglePlayVerifyRequest) -> Result<()> {
+    if !GOOGLE_PLAY_PRODUCT_IDS.contains(&input.product_id.as_str()) {
+        return Err(AppError::BadRequest("unsupported product".into()));
+    }
+    if input.purchase_token.trim().is_empty() || input.purchase_token.len() > 2048 {
+        return Err(AppError::BadRequest("invalid purchase token".into()));
+    }
+    Ok(())
+}
+
+fn service_account_token(account: &ServiceAccount, now: i64) -> Result<String> {
+    let mut header = Header::new(Algorithm::RS256);
+    header.typ = Some("JWT".into());
+    encode(
+        &header,
+        &ServiceAccountClaims {
+            iss: &account.client_email,
+            scope: GOOGLE_PLAY_SCOPE,
+            aud: GOOGLE_TOKEN_URL,
+            exp: now + 3600,
+            iat: now,
+        },
+        &EncodingKey::from_rsa_pem(account.private_key.as_bytes())
+            .map_err(|_| AppError::Internal("Google Play provider unavailable".into()))?,
+    )
+    .map_err(|_| AppError::Internal("Google Play provider unavailable".into()))
+}
+
+async fn google_access_token(client: &Client, account: &ServiceAccount) -> Result<String> {
+    let assertion = service_account_token(account, Utc::now().timestamp())?;
+    let response = client
+        .post(GOOGLE_TOKEN_URL)
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", assertion.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|_| AppError::Internal("Google Play provider unavailable".into()))?;
+    if !response.status().is_success() {
+        return Err(AppError::Internal(
+            "Google Play provider rejected request".into(),
+        ));
+    }
+    response
+        .json::<GoogleTokenResponse>()
+        .await
+        .map(|token| token.access_token)
+        .map_err(|_| AppError::Internal("Google Play provider rejected request".into()))
+}
+
+async fn verify_google_purchase(
+    client: &Client,
+    access_token: &str,
+    package_name: &str,
+    product_id: &str,
+    purchase_token: &str,
+) -> Result<GoogleProductPurchase> {
+    let url = format!(
+        "{GOOGLE_PLAY_API_BASE}/{package_name}/purchases/products/{product_id}/tokens/{purchase_token}"
+    );
+    let response = client
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|_| AppError::Internal("Google Play provider unavailable".into()))?;
+    if !response.status().is_success() {
+        return Err(AppError::Internal(
+            "Google Play provider rejected request".into(),
+        ));
+    }
+    let purchase = response
+        .json::<GoogleProductPurchase>()
+        .await
+        .map_err(|_| AppError::Internal("Google Play provider rejected request".into()))?;
+    if purchase.purchase_state != 0 {
+        return Err(AppError::Conflict("purchase is not completed".into()));
+    }
+    Ok(purchase)
+}
+
+async fn acknowledge_and_consume_google_purchase(
+    client: &Client,
+    access_token: &str,
+    package_name: &str,
+    product_id: &str,
+    purchase_token: &str,
+) -> Result<()> {
+    let acknowledge_url = format!(
+        "{GOOGLE_PLAY_API_BASE}/{package_name}/purchases/products/{product_id}/tokens/{purchase_token}:acknowledge"
+    );
+    let response = client
+        .post(acknowledge_url)
+        .bearer_auth(access_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .map_err(|_| AppError::Internal("Google Play provider unavailable".into()))?;
+    if !response.status().is_success() && response.status() != StatusCode::CONFLICT {
+        return Err(AppError::Internal(
+            "Google Play provider rejected request".into(),
+        ));
+    }
+    let consume_url = format!(
+        "{GOOGLE_PLAY_API_BASE}/{package_name}/purchases/products/{product_id}/tokens/{purchase_token}:consume"
+    );
+    let response = client
+        .post(consume_url)
+        .bearer_auth(access_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .map_err(|_| AppError::Internal("Google Play provider unavailable".into()))?;
+    if !response.status().is_success() && response.status() != StatusCode::CONFLICT {
+        return Err(AppError::Internal(
+            "Google Play provider rejected request".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_google_iap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<GooglePlayVerifyRequest>,
+) -> Result<Json<GooglePlayVerifyResponse>> {
+    let user_id = authenticated_user(&headers, &state.jwt_secret)?;
+    validate_google_play_request(&input)?;
+    if let Some(existing) = sqlx::query_as::<_, ExistingGooglePurchase>(
+        "SELECT user_id, product_id, credits_awarded, bonus_credits_awarded FROM google_play_purchases WHERE purchase_token = $1",
+    )
+    .bind(&input.purchase_token)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(map_db)? {
+        if existing.user_id != user_id || existing.product_id != input.product_id {
+            return Err(AppError::Conflict("purchase token already belongs to another purchase".into()));
+        }
+        let balance = sqlx::query_scalar::<_, i32>("SELECT credits_balance FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(map_db)?;
+        return Ok(Json(GooglePlayVerifyResponse {
+            credits_awarded: existing.credits_awarded,
+            bonus_credits_awarded: existing.bonus_credits_awarded,
+            credits_balance: balance,
+        }));
+    }
+    let service_account_json = env::var("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON")
+        .map_err(|_| AppError::Internal("Google Play provider unavailable".into()))?;
+    let package_name = env::var("GOOGLE_PLAY_PACKAGE_NAME")
+        .map_err(|_| AppError::Internal("Google Play provider unavailable".into()))?;
+    let account = serde_json::from_str::<ServiceAccount>(&service_account_json)
+        .map_err(|_| AppError::Internal("Google Play provider unavailable".into()))?;
+    let client = Client::new();
+    let access_token = google_access_token(&client, &account).await?;
+    let _purchase = verify_google_purchase(
+        &client,
+        &access_token,
+        &package_name,
+        &input.product_id,
+        &input.purchase_token,
+    )
+    .await?;
+    let mut transaction = state.db.begin().await.map_err(map_db)?;
+    let package = sqlx::query_as::<_, (Uuid, i32, i32)>(
+        "SELECT id, credits, bonus_credits FROM credit_packages WHERE product_id = $1",
+    )
+    .bind(&input.product_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(map_db)?
+    .ok_or(AppError::BadRequest("unsupported product".into()))?;
+    let inserted = sqlx::query(
+        "INSERT INTO google_play_purchases (purchase_token, user_id, package_id, product_id, credits_awarded, bonus_credits_awarded) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (purchase_token) DO NOTHING",
+    )
+    .bind(&input.purchase_token)
+    .bind(user_id)
+    .bind(package.0)
+    .bind(&input.product_id)
+    .bind(package.1)
+    .bind(package.2)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_db)?;
+    if inserted.rows_affected() != 1 {
+        transaction.rollback().await.map_err(map_db)?;
+        let existing = sqlx::query_as::<_, ExistingGooglePurchase>(
+            "SELECT user_id, product_id, credits_awarded, bonus_credits_awarded FROM google_play_purchases WHERE purchase_token = $1",
+        )
+        .bind(&input.purchase_token)
+        .fetch_one(&state.db)
+        .await
+        .map_err(map_db)?;
+        if existing.user_id != user_id || existing.product_id != input.product_id {
+            return Err(AppError::Conflict(
+                "purchase token already belongs to another purchase".into(),
+            ));
+        }
+        let balance =
+            sqlx::query_scalar::<_, i32>("SELECT credits_balance FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&state.db)
+                .await
+                .map_err(map_db)?;
+        return Ok(Json(GooglePlayVerifyResponse {
+            credits_awarded: existing.credits_awarded,
+            bonus_credits_awarded: existing.bonus_credits_awarded,
+            credits_balance: balance,
+        }));
+    }
+    let total = package.1 + package.2;
+    let balance = sqlx::query_scalar::<_, i32>(
+        "UPDATE users SET credits_balance = credits_balance + $1 WHERE id = $2 RETURNING credits_balance",
+    )
+    .bind(total)
+    .bind(user_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(map_db)?;
+    insert_credit_transaction(
+        &mut transaction,
+        user_id,
+        package.1,
+        "purchased",
+        "Google Play credit purchase",
+    )
+    .await?;
+    if package.2 > 0 {
+        insert_credit_transaction(
+            &mut transaction,
+            user_id,
+            package.2,
+            "bonus",
+            "Google Play purchase bonus",
+        )
+        .await?;
+    }
+    transaction.commit().await.map_err(map_db)?;
+    acknowledge_and_consume_google_purchase(
+        &client,
+        &access_token,
+        &package_name,
+        &input.product_id,
+        &input.purchase_token,
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE google_play_purchases SET status = 'acknowledged', acknowledged_at = NOW() WHERE purchase_token = $1",
+    )
+    .bind(&input.purchase_token)
+    .execute(&state.db)
+    .await
+    .map_err(map_db)?;
+    Ok(Json(GooglePlayVerifyResponse {
+        credits_awarded: package.1,
+        bonus_credits_awarded: package.2,
+        credits_balance: balance,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -782,6 +1105,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/credits/history", get(credit_history))
         .route("/api/v1/packages", get(packages))
         .route("/api/v1/topups", post(create_topup))
+        .route("/api/v1/iap/google/verify", post(verify_google_iap))
         .route("/api/v1/apps", post(submit_application))
         .route("/api/v1/apps/available", get(available_applications))
         .route("/api/v1/apps/:id/join", post(join_application))
@@ -907,5 +1231,39 @@ mod tests {
             password: "short".into(),
         };
         assert!(validate_credentials(&input).is_err());
+    }
+
+    #[test]
+    fn google_play_accepts_only_the_three_published_product_ids() {
+        for product_id in GOOGLE_PLAY_PRODUCT_IDS {
+            let input = GooglePlayVerifyRequest {
+                product_id: product_id.into(),
+                purchase_token: "token".into(),
+            };
+            assert!(validate_google_play_request(&input).is_ok());
+        }
+        let input = GooglePlayVerifyRequest {
+            product_id: "devtester_credits_unknown".into(),
+            purchase_token: "token".into(),
+        };
+        assert!(matches!(
+            validate_google_play_request(&input),
+            Err(AppError::BadRequest(message)) if message == "unsupported product"
+        ));
+    }
+
+    #[test]
+    fn google_play_rejects_empty_or_oversized_purchase_tokens() {
+        let empty = GooglePlayVerifyRequest {
+            product_id: GOOGLE_PLAY_PRODUCT_IDS[0].into(),
+            purchase_token: "  ".into(),
+        };
+        assert!(validate_google_play_request(&empty).is_err());
+
+        let oversized = GooglePlayVerifyRequest {
+            product_id: GOOGLE_PLAY_PRODUCT_IDS[0].into(),
+            purchase_token: "x".repeat(2049),
+        };
+        assert!(validate_google_play_request(&oversized).is_err());
     }
 }
