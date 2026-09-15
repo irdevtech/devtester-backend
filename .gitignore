@@ -1,5 +1,6 @@
 # Local environment and secrets
 .env
+render_logs.txt
 .env.*
 !.env.example
 
