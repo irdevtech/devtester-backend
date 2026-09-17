@@ -37,6 +37,8 @@ static RATE_LIMITER: OnceLock<Mutex<HashMap<String, Vec<Instant>>>> = OnceLock::
 struct AppState {
     db: PgPool,
     jwt_secret: Arc<String>,
+    google_client_id: Arc<String>,
+    http_client: Client,
 }
 
 #[derive(Debug, Error)]
@@ -127,6 +129,19 @@ struct AuthRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct GoogleAuthRequest {
+    id_token: String,
+}
+
+#[derive(Deserialize)]
+struct GoogleTokenInfo {
+    aud: String,
+    sub: String,
+    email: String,
+    email_verified: Option<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AuthResponse {
@@ -138,7 +153,7 @@ struct AuthResponse {
 #[derive(FromRow)]
 struct UserRow {
     id: Uuid,
-    password_hash: String,
+    password_hash: Option<String>,
     credits_balance: i32,
 }
 
@@ -190,13 +205,93 @@ async fn login(
     .await
     .map_err(map_db)?
     .ok_or(AppError::Unauthorized)?;
-    if !verify_password(&input.password, &row.password_hash)? {
+    if !verify_password(
+        &input.password,
+        row.password_hash.as_deref().ok_or(AppError::Unauthorized)?,
+    )? {
         return Err(AppError::Unauthorized);
     }
     Ok(Json(AuthResponse {
         access_token: token(row.id, &state.jwt_secret)?,
         user_id: row.id,
         credits_balance: row.credits_balance,
+    }))
+}
+
+async fn google_login(
+    State(state): State<AppState>,
+    Json(input): Json<GoogleAuthRequest>,
+) -> Result<Json<AuthResponse>> {
+    if input.id_token.trim().is_empty() || input.id_token.len() > 4096 {
+        return Err(AppError::BadRequest(
+            "valid Google ID token is required".into(),
+        ));
+    }
+    let info = state
+        .http_client
+        .get("https://oauth2.googleapis.com/tokeninfo")
+        .query(&[("id_token", input.id_token.as_str())])
+        .send()
+        .await
+        .map_err(|_| AppError::Unauthorized)?
+        .error_for_status()
+        .map_err(|_| AppError::Unauthorized)?
+        .json::<GoogleTokenInfo>()
+        .await
+        .map_err(|_| AppError::Unauthorized)?;
+    if info.aud != *state.google_client_id
+        || info.sub.trim().is_empty()
+        || info.email.trim().is_empty()
+        || info.email_verified.as_deref() != Some("true")
+    {
+        return Err(AppError::Unauthorized);
+    }
+
+    let email = info.email.trim().to_lowercase();
+    let mut transaction = state.db.begin().await.map_err(map_db)?;
+    let row = sqlx::query_as::<_, UserRow>(
+        "SELECT id, password_hash, credits_balance FROM users WHERE google_sub = $1 OR email = $2 FOR UPDATE",
+    )
+    .bind(&info.sub)
+    .bind(&email)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(map_db)?;
+
+    let (user_id, credits_balance) = if let Some(row) = row {
+        sqlx::query("UPDATE users SET google_sub = COALESCE(google_sub, $1) WHERE id = $2")
+            .bind(&info.sub)
+            .bind(row.id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_db)?;
+        (row.id, row.credits_balance)
+    } else {
+        let row = sqlx::query_as::<_, UserRow>(
+            "INSERT INTO users (email, google_sub, password_hash, credits_balance) VALUES ($1, $2, NULL, $3) RETURNING id, password_hash, credits_balance",
+        )
+        .bind(&email)
+        .bind(&info.sub)
+        .bind(REGISTRATION_BONUS)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(map_db)?;
+        sqlx::query(
+            "INSERT INTO credit_transactions (user_id, amount, type, description) VALUES ($1, $2, 'bonus', $3)",
+        )
+        .bind(row.id)
+        .bind(REGISTRATION_BONUS)
+        .bind("Google registration bonus")
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_db)?;
+        (row.id, row.credits_balance)
+    };
+    transaction.commit().await.map_err(map_db)?;
+    Ok(Json(AuthResponse {
+        access_token: token(user_id, &state.jwt_secret)?,
+        user_id,
+        credits_balance,
     }))
 }
 
@@ -1101,6 +1196,7 @@ fn app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/v1/auth/register", post(register))
         .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/google", post(google_login))
         .route("/api/v1/credits/balance", get(credit_balance))
         .route("/api/v1/credits/history", get(credit_history))
         .route("/api/v1/packages", get(packages))
@@ -1127,6 +1223,8 @@ async fn main() -> Result<()> {
         .map_err(|_| AppError::Internal("DATABASE_URL is required".into()))?;
     let jwt_secret =
         env::var("JWT_SECRET").map_err(|_| AppError::Internal("JWT_SECRET is required".into()))?;
+    let google_client_id = env::var("GOOGLE_AUTH_CLIENT_ID")
+        .map_err(|_| AppError::Internal("GOOGLE_AUTH_CLIENT_ID is required".into()))?;
     let db = PgPoolOptions::new()
         .max_connections(10)
         .connect(&database_url)
@@ -1139,6 +1237,8 @@ async fn main() -> Result<()> {
     let state = AppState {
         db,
         jwt_secret: Arc::new(jwt_secret),
+        google_client_id: Arc::new(google_client_id),
+        http_client: Client::new(),
     };
     let port = env::var("PORT")
         .ok()
